@@ -3,7 +3,7 @@
 # integration
 function do_cauchy(fs::NTuple{N,F}, s::NTuple{M,T}, cs::NTuple{N,U}, n_gk, n_cc, atol, rtol, maxevals, nrm) where {F,T,U,N,M}
   gk_rule = cachedrule(eltype(s), n_gk)
-  cc_rule = cachedpoints(eltype(s), n_cc); cc_rule = cc_rule[2:2:end], cc_rule[1:2:end]
+  cc_rule = cachedpoints(eltype(s), n_cc)
 
   @assert M == N + 1
   segs = ntuple(i -> evalrule_cauchy(fs[i], s[i], s[i+1], cs[i], gk_rule, cc_rule, nrm), Val{N}())
@@ -71,76 +71,59 @@ function adapt_cauchy(segs::Vector{T}, I, E, numevals, n_gk, n_cc, gk_rule, cc_r
   return (I, E)
 end
 
-function dct2(x::Vector, p::Vector, k, n)
-  return 0.5 * (x[1] + (-1)^(k+1) * x[end]) + sum(x[j] * cos((k-1) * p[j]) for j in 2:n-1)
-end
-
-function dct1(x::Vector, p::Vector, k, n)
-  return sum(x[j] * cos((k-1) * p[j]) for j in 1:n)
-end
-
-function evalrule_cauchy(fn, a::T, b::T, c::T, rk_rule, cc_rule, nrm) where {T}
-  d = T((2 * c - b - a) / (b - a)) # Determine how close we are to the pole
+function evalrule_cauchy(fn, a, b, c, rk_rule, cc_rule, nrm)
+  d = (2 * c - b - a) / (b - a) # Determine how close we are to the pole
 
   if abs(d) > 1.1 # Use Gauss-Kronrod if far away
     seg = evalrule(x -> fn(x) / (x - c), a, b, rk_rule[1], rk_rule[2], rk_rule[3], nrm)
     return CauchySegment(fn, c, oftype(d, a), oftype(d, b), seg.I, seg.E)
   
   else # Use modified Clenshaw-Curtis if close
-    n₂ = length(cc_rule[2])
-    n₁ = length(cc_rule[1]) + n₂
+    n = length(cc_rule)
 
-    # Initial values for the modified moments
-    μⱼ = log(abs((1.0 - d) / (1.0 + d)))
+    f = [fn(b + (1 - cos(cc_rule[i])) * (a-b)/2) for i in 1:n]
 
-    # Function evaluation
-    f2 = fn.(b .+ (1 .- cos.(cc_rule[2])) .* (a-b)/2)
-    f1 = fn.(b .+ (1 .- cos.(cc_rule[1])) .* (a-b)/2)
-
-    # unroll first loop iteration
-    cs₂ = dct2(f2, cc_rule[2], 1, n₂)
-    cs₁ = dct1(f1, cc_rule[1], 1, n₂-1) + cs₂
-
-    # Integrals with (n+1)/2-point and n-point Clenshaw-Curtis quadrature
-    I₂ = 1.0/(n₂-1) * cs₂ * μⱼ
-    I₁ = 1.0/(n₁-1) * cs₁ * μⱼ
-
-    # update moments
-    μⱼ, μⱼ₋₁ = μⱼ * d + 2.0, μⱼ
+    @views c₂ = clenshawcurtis(f[1:2:end])
+    c₁ = clenshawcurtis(f)
     
-    for j in 2:n₂-1
-      # calculate unnormalized coefficients
-      cs₂ = dct2(f2, cc_rule[2], j, n₂)
-      cs₁ = dct1(f1, cc_rule[1], j, n₂-1) + cs₂
+    μ = compute_moments(d, n)
 
-      I₂ += 2.0/(n₂-1) * cs₂ * μⱼ
-      I₁ += 2.0/(n₁-1) * cs₁ * μⱼ
-
-      # update moments
-      cst = isodd(j) ? T(4)/T(1 - (j-1)^2) : 0.0
-      μⱼ, μⱼ₋₁ = 2d * μⱼ - μⱼ₋₁ + cst, μⱼ
-    end
-
-    cs₂ = dct2(f2, cc_rule[2], n₂, n₂)
-    I₂ += 1.0/(n₂-1) * cs₂ * μⱼ
-
-    for j in n₂:n₁-1
-      cs₁ = dct2(f2, cc_rule[2], j, n₂) + dct1(f1, cc_rule[1], j, n₂-1)
-      I₁ += 2.0/(n₁-1) * cs₁ * μⱼ
-
-      # update moments
-      cst = isodd(j) ? T(4)/T(1 - (j-1)^2) : 0.0
-      μⱼ, μⱼ₋₁ = 2d * μⱼ - μⱼ₋₁ + cst, μⱼ
-    end
-
-    cs₁ = dct2(f2, cc_rule[2], n₁, n₂) + dct1(f1, cc_rule[1], n₁, n₂-1)
-    I₁ += 1.0/(n₁-1) * cs₁ * μⱼ
+    I₁ = sum(c₁[i] * μ[i] for i in 1:n)
+    I₂ = sum(c₂[i] * μ[i] for i in 1:length(c₂))
 
     return CauchySegment(fn, c, oftype(d, a), oftype(d, b), I₁, abs(I₁ - I₂))
   end
 end
 
 cachedpoints(::Type{T}, n::Integer) where T<:Number = n == 1 ? error() : float(T)[π * k / (n-1) for k=0:n-1]
+
+function clenshawcurtis(x)
+  n = length(x)
+
+  # Fast cosine transform
+  z = zeros(eltype(x), 4(n-1))
+  z[1:2:2n] = x
+  @views z[2n+1:2:4(n-1)] = x[end-1:-1:2]
+  z = generic_fft_pow2!(z)
+  z = z[1:2:2*n]
+
+  rmul!(z, inv(n-1))
+  z[1] *= 0.5; z[end] *= 0.5;
+  return z
+end
+
+function compute_moments(cc::T, n::Int) where T
+  μ = zeros(T, n)
+  n > 0 && (μ[1] = log(abs((1.0 - cc) / (1.0 + cc))))
+  if n > 1
+    μ[2] = μ[1] * cc + 2
+    for i=2:n
+      cst = isodd(i) ? T(4)/T(1 - (i-1)^2) : 0.0
+      @inbounds μ[i+1] = 2cc * μ[i] - μ[i-1] + cst
+    end
+  end
+  μ
+end
 
 struct CauchySegment{TF,TX,TI,TE}
   f::TF
@@ -152,7 +135,7 @@ struct CauchySegment{TF,TX,TI,TE}
 end
 Base.isless(i::CauchySegment, j::CauchySegment) = isless(i.E, j.E)
 
-@generated function unroll_poles(z, seq::NTuple{N,T}) where {N,T} 
+@generated function unroll_poles(z, seq::Vararg{T,N}) where {T,N} 
   expand(i) = i == 0 ? :1 : :(*(z - seq[$i], $(expand(i-1))))
   return expand(N)
 end
@@ -174,19 +157,17 @@ will hold.
 """
 cauchy(f, a, bs...; kws...) = cauchy(f, promote(a,bs...)..., kws...)
 
-function cauchy(f, a::T, bs::Vararg{T,N};
-                atol=nothing, rtol=nothing, maxevals=10^7, order_gk=7, order_cc=25, norm=norm) where {T,N}
+function cauchy(f, a::T, bs::Vararg{T,N}; 
+  atol=nothing, rtol=nothing, maxevals=10^7, order_gk=7, order_cc=17, norm=norm) where {T,N}
   
   cs, b = init(bs), last(bs)
 
-  if cs != tuple(unique(cs)...)
-    error("can only integrate simple poles")
+  if !issorted(cs)
+    error("poles must be sorted")
   end
 
-  cs = tuple(sort([cs...])...)
-
   if cs[1] ≤ a || cs[end] ≥ b
-    error("singularities must lie inside the integration boundaries")
+    error("poles must lie inside the integration boundaries")
   end
 
   if iseven(order_cc)
@@ -202,8 +183,7 @@ function cauchy(f, a::T, bs::Vararg{T,N};
   if isone(length(cs))
     fs = tuple(f)
   else
-    zs = ntuple(i -> tuple(cs[1:i-1]..., cs[i+1:end]...), Val{N-1}())
-    fs = ntuple(i -> (z -> f(z) / unroll_poles(z, zs[i])), Val{N-1}())
+    fs = ntuple(i -> (z -> f(z) / unroll_poles(z, cs[1:i-1]..., cs[i+1:end]...)), Val{N-1}())
   end
-  do_cauchy(fs, convert.(float(T), segs), convert.(float(T), cs), order_gk, order_cc, atol, rtol, maxevals, norm)
+  do_cauchy(fs, segs, cs, order_gk, order_cc, atol, rtol, maxevals, norm)
 end

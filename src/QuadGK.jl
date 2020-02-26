@@ -27,6 +27,7 @@ export quadgk, gauss, kronrod, cauchy
 
 using DataStructures, LinearAlgebra
 import Base.Order.Reverse
+using FastTransforms: generic_fft_pow2!
 
 include("gausskronrod.jl")
 include("evalrule.jl")
